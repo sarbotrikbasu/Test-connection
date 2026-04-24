@@ -1,0 +1,10 @@
+MetaTrader5
+python-dotenv
+pandas
+numpy
+fastapi
+uvicorn
+asyncio
+datetime
+typing
+
