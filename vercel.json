@@ -1,9 +1,14 @@
 {
-  "framework": null,
-  "rewrites": [
+  "builds": [
     {
-      "source": "/(.*)",
-      "destination": "/hello_frontend.html"
+      "src": "mf_api.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "mf_api.py"
     }
   ]
 }
