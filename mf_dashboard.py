@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Optional, List
+import io
 
 import requests
 import streamlit as st
@@ -785,6 +786,350 @@ if st.session_state.show_dashboard and st.session_state.perf_data:
 
         df = pd.DataFrame(rows)
         st.dataframe(df, use_container_width=True, hide_index=True, height=400)
+
+    # ── 2g: Excel Export ─────────────────────────────────────
+    st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">📥 Download Analysis Report</div>', unsafe_allow_html=True)
+
+    def build_excel_report() -> bytes:
+        """Build a formatted multi-sheet Excel workbook and return as bytes."""
+        import openpyxl
+        from openpyxl.styles import (
+            PatternFill, Font, Alignment, Border, Side, GradientFill
+        )
+        from openpyxl.utils import get_column_letter
+        from openpyxl.worksheet.worksheet import Worksheet
+        from datetime import datetime
+
+        wb = openpyxl.Workbook()
+
+        # ── Palette ──────────────────────────────────────────────
+        DARK_BG     = "0B0F19"
+        CARD_BG     = "111827"
+        ACCENT      = "00D4AA"
+        BLUE        = "3B82F6"
+        TEXT_LIGHT  = "E2E8F0"
+        TEXT_MUTED  = "94A3B8"
+        GREEN_BG    = "14532D"
+        GREEN_FG    = "22C55E"
+        RED_BG      = "7F1D1D"
+        RED_FG      = "EF4444"
+        NEUTRAL_FG  = "94A3B8"
+        HEADER_BG   = "0D1F3C"
+        BORDER_CLR  = "1E293B"
+
+        thin = Border(
+            left=Side(style='thin', color=BORDER_CLR),
+            right=Side(style='thin', color=BORDER_CLR),
+            top=Side(style='thin', color=BORDER_CLR),
+            bottom=Side(style='thin', color=BORDER_CLR),
+        )
+
+        def hdr_font(bold=True, size=11, color=TEXT_LIGHT):
+            return Font(bold=bold, size=size, color=color, name='Calibri')
+
+        def cell_font(bold=False, size=10, color=TEXT_LIGHT):
+            return Font(bold=bold, size=size, color=color, name='Calibri')
+
+        def fill(hex_color: str):
+            return PatternFill("solid", fgColor=hex_color)
+
+        def center():
+            return Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+        def left():
+            return Alignment(horizontal='left', vertical='center', wrap_text=True)
+
+        def right():
+            return Alignment(horizontal='right', vertical='center')
+
+        def pct_color(val_str: str):
+            """Return (bg_hex, fg_hex) based on +/- sign in fmt_pct string."""
+            if val_str.startswith('+'):
+                return GREEN_BG, GREEN_FG
+            elif val_str.startswith('-'):
+                return RED_BG, RED_FG
+            return CARD_BG, NEUTRAL_FG
+
+        def style_header_row(ws, row: int, columns: list[str], bg=HEADER_BG):
+            for col_idx, text in enumerate(columns, start=1):
+                c = ws.cell(row=row, column=col_idx, value=text)
+                c.fill = fill(bg)
+                c.font = hdr_font()
+                c.alignment = center()
+                c.border = thin
+
+        def auto_col_widths(ws: Worksheet, min_w=12, max_w=50):
+            for col in ws.columns:
+                w = min_w
+                for cell in col:
+                    if cell.value:
+                        w = max(w, min(max_w, len(str(cell.value)) + 4))
+                ws.column_dimensions[get_column_letter(col[0].column)].width = w
+
+        # ══════════════════════════════════════════════════════════
+        # SHEET 1 — Portfolio Summary
+        # ══════════════════════════════════════════════════════════
+        ws1 = wb.active
+        ws1.title = "Portfolio Summary"
+        ws1.sheet_view.showGridLines = False
+        ws1.sheet_properties.tabColor = ACCENT
+
+        # Title block
+        ws1.row_dimensions[1].height = 32
+        ws1.merge_cells('A1:H1')
+        title_cell = ws1['A1']
+        title_cell.value = "📈  MF Portfolio Analyzer — Analysis Report"
+        title_cell.font = Font(bold=True, size=16, color=ACCENT, name='Calibri')
+        title_cell.fill = fill(DARK_BG)
+        title_cell.alignment = center()
+
+        ws1.row_dimensions[2].height = 20
+        ws1.merge_cells('A2:H2')
+        sub = ws1['A2']
+        sub.value = f"Generated on {datetime.now().strftime('%d %b %Y, %I:%M %p')}  ·  Data sourced from mfapi.in via OrivisAlpha"
+        sub.font = Font(size=9, color=TEXT_MUTED, name='Calibri')
+        sub.fill = fill(DARK_BG)
+        sub.alignment = center()
+
+        # KPI Table header
+        ws1.row_dimensions[4].height = 22
+        style_header_row(ws1, 4, ["Metric", "Value", "Notes"], bg=HEADER_BG)
+        for c in ['A', 'B', 'C']:
+            ws1[f'{c}4'].fill = fill(HEADER_BG)
+
+        # KPI rows
+        kpi_rows = [
+            ("Total Invested (₹)",       f"₹{total_inv:,.0f}",          "Sum across all portfolio funds"),
+            ("Funds Tracked",             str(len(perf_data)),            "Number of funds in portfolio"),
+            ("Portfolio 1M Return",       fmt_pct(pf_1m),                 "Combined NAV basis (1 unit each)"),
+            ("vs Nifty 50 (1M)",          vs_nifty_str,                   "Portfolio alpha vs benchmark"),
+            ("Best Fund (1M)",             fmt_pct(best_fund[1]),          best_fund[0]),
+            ("Worst Fund (1M)",            fmt_pct(worst_fund[1]),         worst_fund[0]),
+            ("Portfolio NAV (1u each) ₹", f"{total_nav_current:,.4f}",    "Sum of 1 unit NAV per fund"),
+        ]
+        for r_idx, (metric, value, note) in enumerate(kpi_rows, start=5):
+            ws1.row_dimensions[r_idx].height = 20
+            bg = CARD_BG if r_idx % 2 == 0 else DARK_BG
+            for col_idx, (val, algn) in enumerate([
+                (metric, left()), (value, center()), (note, left())
+            ], start=1):
+                c = ws1.cell(row=r_idx, column=col_idx, value=val)
+                c.fill = fill(bg)
+                c.font = cell_font(bold=(col_idx == 2), size=10)
+                c.alignment = algn
+                c.border = thin
+                # Colour the value cell
+                if col_idx == 2:
+                    if str(val).startswith('+'):
+                        c.font = cell_font(bold=True, size=10, color=GREEN_FG)
+                    elif str(val).startswith('-'):
+                        c.font = cell_font(bold=True, size=10, color=RED_FG)
+                    else:
+                        c.font = cell_font(bold=True, size=10, color=ACCENT)
+
+        # Period-by-period portfolio overview sub-table
+        r = len(kpi_rows) + 7
+        ws1.row_dimensions[r].height = 22
+        ws1.merge_cells(f'A{r}:H{r}')
+        period_hdr = ws1[f'A{r}']
+        period_hdr.value = "Portfolio % Change — Period Breakdown (Combined NAV)"
+        period_hdr.font = hdr_font(size=12, color=ACCENT)
+        period_hdr.fill = fill(DARK_BG)
+        period_hdr.alignment = left()
+
+        r += 1
+        style_header_row(ws1, r, ["Period"] + ["% Change"], bg=HEADER_BG)
+        for pk, pl in zip(PERIOD_KEYS, PERIOD_LABELS):
+            r += 1
+            val_str = fmt_pct(pf_changes.get(pk))
+            bg_c, fg_c = pct_color(val_str)
+            row_bg = CARD_BG if r % 2 == 0 else DARK_BG
+            c1 = ws1.cell(row=r, column=1, value=pl)
+            c1.fill = fill(row_bg); c1.font = cell_font(); c1.alignment = left(); c1.border = thin
+            c2 = ws1.cell(row=r, column=2, value=val_str)
+            c2.fill = fill(bg_c); c2.font = cell_font(bold=True, color=fg_c); c2.alignment = center(); c2.border = thin
+
+        ws1.column_dimensions['A'].width = 36
+        ws1.column_dimensions['B'].width = 22
+        ws1.column_dimensions['C'].width = 48
+
+        # ══════════════════════════════════════════════════════════
+        # SHEET 2 — Fund Performance
+        # ══════════════════════════════════════════════════════════
+        ws2 = wb.create_sheet("Fund Performance")
+        ws2.sheet_view.showGridLines = False
+        ws2.sheet_properties.tabColor = BLUE
+
+        ws2.row_dimensions[1].height = 28
+        ws2.merge_cells('A1:K1')
+        t2 = ws2['A1']
+        t2.value = "Individual Fund Performance"
+        t2.font = Font(bold=True, size=14, color=ACCENT, name='Calibri')
+        t2.fill = fill(DARK_BG)
+        t2.alignment = center()
+
+        period_cols = [pl for pl in PERIOD_LABELS]
+        headers = ["Fund Name", "Scheme Code", "Current NAV (₹)", "NAV Date",
+                   "Invested (₹)"] + period_cols
+        style_header_row(ws2, 3, headers)
+
+        for r_idx, fd in enumerate(perf_data, start=4):
+            ws2.row_dimensions[r_idx].height = 20
+            bg = CARD_BG if r_idx % 2 == 0 else DARK_BG
+
+            row_vals = [
+                fd["scheme_name"],
+                fd.get("scheme_code", "—"),
+                round(fd.get("current_nav", 0), 4),
+                fd.get("current_date", "—"),
+                fd.get("invested", 0),
+            ]
+            for pk in PERIOD_KEYS:
+                row_vals.append(fmt_pct(get_pct(fd, pk)))
+
+            for col_idx, val in enumerate(row_vals, start=1):
+                c = ws2.cell(row=r_idx, column=col_idx, value=val)
+                c.fill = fill(bg)
+                c.border = thin
+                # Period % columns start at col 6
+                if col_idx >= 6:
+                    bg_c, fg_c = pct_color(str(val))
+                    c.fill = fill(bg_c)
+                    c.font = cell_font(bold=True, color=fg_c)
+                    c.alignment = center()
+                elif col_idx in (3, 5):  # NAV and Invested
+                    c.font = cell_font(bold=True, color=ACCENT)
+                    c.alignment = right()
+                elif col_idx == 2:
+                    c.font = cell_font(color=BLUE)
+                    c.alignment = center()
+                else:
+                    c.font = cell_font(color=TEXT_LIGHT)
+                    c.alignment = left()
+
+        # Portfolio aggregate at bottom
+        agg_row = len(perf_data) + 5
+        ws2.row_dimensions[agg_row].height = 22
+        agg_vals = [
+            "📁 Portfolio (combined NAV)", "—",
+            round(total_nav_current, 4), "—", f"₹{total_inv:,.0f}",
+        ]
+        for pk in PERIOD_KEYS:
+            agg_vals.append(fmt_pct(pf_changes.get(pk)))
+        for col_idx, val in enumerate(agg_vals, start=1):
+            c = ws2.cell(row=agg_row, column=col_idx, value=val)
+            c.fill = fill(HEADER_BG)
+            c.border = thin
+            if col_idx >= 6:
+                bg_c, fg_c = pct_color(str(val))
+                c.fill = fill(bg_c)
+                c.font = hdr_font(color=fg_c)
+                c.alignment = center()
+            else:
+                c.font = hdr_font(color=ACCENT)
+                c.alignment = left()
+
+        auto_col_widths(ws2)
+
+        # ══════════════════════════════════════════════════════════
+        # SHEET 3 — Benchmark Comparison
+        # ══════════════════════════════════════════════════════════
+        ws3 = wb.create_sheet("Benchmark Comparison")
+        ws3.sheet_view.showGridLines = False
+        ws3.sheet_properties.tabColor = "F59E0B"
+
+        ws3.row_dimensions[1].height = 28
+        ws3.merge_cells('A1:H1')
+        t3 = ws3['A1']
+        t3.value = "Portfolio vs Benchmarks"
+        t3.font = Font(bold=True, size=14, color=ACCENT, name='Calibri')
+        t3.fill = fill(DARK_BG)
+        t3.alignment = center()
+
+        bm_headers = ["Name", "Symbol", "Current Price", "Currency"] + period_cols
+        style_header_row(ws3, 3, bm_headers)
+
+        # Portfolio row first
+        BM_KEY_MAP3 = {"1d": "change_1d", "1w": "change_1w", "1m": "change_1m",
+                       "3m": "change_3m", "6m": "change_6m"}
+        pf_bm_row = ["📁 Portfolio (NAV)", "—", round(total_nav_current, 4), "INR"]
+        for pk in PERIOD_KEYS:
+            pf_bm_row.append(fmt_pct(pf_changes.get(pk)))
+        for col_idx, val in enumerate(pf_bm_row, start=1):
+            c = ws3.cell(row=4, column=col_idx, value=val)
+            c.fill = fill(HEADER_BG)
+            c.border = thin
+            if col_idx >= 5:
+                bg_c, fg_c = pct_color(str(val))
+                c.fill = fill(bg_c)
+                c.font = hdr_font(color=fg_c)
+                c.alignment = center()
+            else:
+                c.font = hdr_font(color=ACCENT)
+                c.alignment = left()
+
+        for r_idx, bm in enumerate(bm_data, start=5):
+            ws3.row_dimensions[r_idx].height = 20
+            bg = CARD_BG if r_idx % 2 == 0 else DARK_BG
+            price = bm.get("current_price")
+            bm_row = [
+                bm["name"], bm["symbol"],
+                round(price, 4) if price else "N/A",
+                bm.get("currency") or "—",
+            ]
+            for pk in PERIOD_KEYS:
+                bm_row.append(fmt_pct(bm.get(BM_KEY_MAP3[pk])))
+            for col_idx, val in enumerate(bm_row, start=1):
+                c = ws3.cell(row=r_idx, column=col_idx, value=val)
+                c.fill = fill(bg)
+                c.border = thin
+                if col_idx >= 5:
+                    bg_c, fg_c = pct_color(str(val))
+                    c.fill = fill(bg_c)
+                    c.font = cell_font(bold=True, color=fg_c)
+                    c.alignment = center()
+                else:
+                    c.font = cell_font(color=TEXT_LIGHT)
+                    c.alignment = left()
+
+        auto_col_widths(ws3)
+
+        # ── Save to bytes buffer ──────────────────────────────────
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return buf.getvalue()
+
+    # Build the file and render the download button
+    from datetime import datetime as _dt
+    _report_name = f"MF_Portfolio_Analysis_{_dt.now().strftime('%Y%m%d_%H%M')}.xlsx"
+
+    excel_bytes = build_excel_report()
+
+    st.markdown("""
+    <div style="display:flex; align-items:center; gap:1rem;
+         background:linear-gradient(135deg,#0d1f3c,#111827);
+         border:1px solid #1e293b; border-radius:14px;
+         padding:1.2rem 1.6rem; margin-bottom:1.2rem">
+      <div style="font-size:2rem">📊</div>
+      <div>
+        <div style="font-size:0.95rem; font-weight:600; color:#e2e8f0;">Download Full Analysis as Excel</div>
+        <div style="font-size:0.78rem; color:#64748b; margin-top:0.2rem;">
+          3 sheets: Portfolio Summary · Fund Performance (with colour-coded returns) · Benchmark Comparison
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.download_button(
+        label="⬇️  Download Excel Report",
+        data=excel_bytes,
+        file_name=_report_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        type="primary",
+    )
 
     # ── Footnote ──────────────────────────────────────────────
     st.markdown(
