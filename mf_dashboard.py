@@ -402,6 +402,19 @@ if st.session_state.show_dashboard and st.session_state.perf_data:
     )
 
     # ── Helpers ──────────────────────────────────────────────
+    import re as _re
+
+    def rgb_to_rgba(color: str, alpha: float = 0.2) -> str:
+        """Convert plotly's 'rgb(r,g,b)' or '#rrggbb' to 'rgba(r,g,b,a)'."""
+        m = _re.match(r'rgb\((\d+),\s*(\d+),\s*(\d+)\)', color)
+        if m:
+            return f"rgba({m.group(1)},{m.group(2)},{m.group(3)},{alpha})"
+        h = color.lstrip('#')
+        if len(h) == 6:
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+            return f"rgba({r},{g},{b},{alpha})"
+        return color  # fallback: return unchanged
+
     def get_pct(fund_data: dict, period: str) -> Optional[float]:
         key = f"change_{period}"
         ch = fund_data.get(key, {})
@@ -675,7 +688,7 @@ if st.session_state.show_dashboard and st.session_state.perf_data:
             r=r_vals,
             theta=theta_labels,
             fill="toself",
-            fillcolor=colors[i % len(colors)] + "33",
+            fillcolor=rgb_to_rgba(colors[i % len(colors)], 0.2),
             line=dict(color=colors[i % len(colors)], width=2),
             name=name_short,
         ))
