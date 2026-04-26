@@ -559,7 +559,7 @@ if st.session_state.show_dashboard and st.session_state.perf_data:
             "3m": ("3 Months", "change_3m"),
             "6m": ("6 Months", "change_6m"),
         }
-        BM_ICONS = {"^NSEI": "🇮🇳", "^GSPC": "🇺🇸", "XAUUSD=X": "🥇", "XAGUSD=X": "🥈"}
+        BM_ICONS = {"^NSEI": "🇮🇳", "^GSPC": "🇺🇸", "GC=F": "🥇", "SI=F": "🥈"}
         for col, bm in zip(bm_cols, bm_data):
             with col:
                 icon = BM_ICONS.get(bm["symbol"], "📊")
@@ -642,7 +642,7 @@ if st.session_state.show_dashboard and st.session_state.perf_data:
         st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
         st.markdown('<div class="section-label">📊 Portfolio vs Benchmarks</div>', unsafe_allow_html=True)
         bm_bar = go.Figure()
-        BM_COLORS = {"^NSEI": "#f59e0b", "^GSPC": "#3b82f6", "XAUUSD=X": "#fbbf24", "XAGUSD=X": "#94a3b8"}
+        BM_COLORS = {"^NSEI": "#f59e0b", "^GSPC": "#3b82f6", "GC=F": "#fbbf24", "SI=F": "#94a3b8"}
         BM_KEY_MAP = {"1d": "change_1d", "1w": "change_1w", "1m": "change_1m", "3m": "change_3m", "6m": "change_6m"}
 
         # Portfolio aggregate

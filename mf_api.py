@@ -254,10 +254,10 @@ async def search_funds(
 # ──────────────────────────────────────────────
 
 BENCHMARK_SYMBOLS = [
-    {"symbol": "^NSEI",    "name": "Nifty 50"},
-    {"symbol": "^GSPC",    "name": "S&P 500"},
-    {"symbol": "XAUUSD=X", "name": "Gold Spot"},
-    {"symbol": "XAGUSD=X", "name": "Silver Spot"},
+    {"symbol": "^NSEI", "name": "Nifty 50"},
+    {"symbol": "^GSPC", "name": "S&P 500"},
+    {"symbol": "GC=F",  "name": "Gold (Futures)"},
+    {"symbol": "SI=F",  "name": "Silver (Futures)"},
 ]
 
 # Trading sessions to look back per period
