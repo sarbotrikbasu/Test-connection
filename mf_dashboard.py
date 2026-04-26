@@ -161,6 +161,9 @@ if "perf_data" not in st.session_state:
 if "show_dashboard" not in st.session_state:
     st.session_state["show_dashboard"] = False
 
+if "benchmark_data" not in st.session_state:
+    st.session_state["benchmark_data"] = []
+
 # ──────────────────────────────────────────────────────────────
 # API Helpers
 # ──────────────────────────────────────────────────────────────
@@ -185,6 +188,16 @@ def get_fund_performance(scheme_code: int) -> Optional[dict]:
     except Exception as e:
         st.warning(f"Could not fetch data for scheme {scheme_code}: {e}")
         return None
+
+
+def get_benchmarks() -> List[dict]:
+    try:
+        r = requests.get(f"{API_BASE}/benchmarks", timeout=30)
+        r.raise_for_status()
+        return r.json().get("benchmarks", [])
+    except Exception as e:
+        st.warning(f"Could not fetch benchmark data: {e}")
+        return []
 
 # ──────────────────────────────────────────────────────────────
 # Portfolio Helpers
@@ -366,7 +379,10 @@ with col_portfolio:
                     if perf:
                         perf["invested"] = fund["invested"]
                         results_data.append(perf)
+            with st.spinner("Fetching benchmark data (Nifty 50, S&P 500, Gold, Silver)…"):
+                bm_data = get_benchmarks()
             st.session_state.perf_data = results_data
+            st.session_state.benchmark_data = bm_data
             st.session_state.show_dashboard = True
             st.rerun()
 
@@ -376,6 +392,7 @@ with col_portfolio:
 
 if st.session_state.show_dashboard and st.session_state.perf_data:
     perf_data = st.session_state.perf_data
+    bm_data   = st.session_state.get("benchmark_data", [])
 
     st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
     st.markdown(
@@ -384,11 +401,17 @@ if st.session_state.show_dashboard and st.session_state.perf_data:
         unsafe_allow_html=True,
     )
 
-    # ── Helper: extract change pct ───────────────────────────
+    # ── Helpers ──────────────────────────────────────────────
     def get_pct(fund_data: dict, period: str) -> Optional[float]:
         key = f"change_{period}"
         ch = fund_data.get(key, {})
         return ch.get("change_pct") if ch else None
+
+    def get_hist_nav(fund_data: dict, period: str) -> Optional[float]:
+        """Historical NAV for a given period from the fund performance dict."""
+        key = f"change_{period}"
+        ch = fund_data.get(key, {})
+        return ch.get("nav") if ch else None
 
     def fmt_pct(v: Optional[float]) -> str:
         if v is None:
@@ -401,25 +424,78 @@ if st.session_state.show_dashboard and st.session_state.perf_data:
             return "change-neutral"
         return "change-pos" if v >= 0 else "change-neg"
 
+    # ── Portfolio NAV-sum % changes ──────────────────────────
+    # Total portfolio value = sum of 1 unit NAV of each fund
+    total_nav_current = sum(fd.get("current_nav", 0) for fd in perf_data)
+
+    def portfolio_pct(period: str) -> Optional[float]:
+        hist_navs = [get_hist_nav(fd, period) for fd in perf_data]
+        if any(h is None for h in hist_navs):
+            return None
+        total_hist = sum(hist_navs)
+        if total_hist == 0:
+            return None
+        return round(((total_nav_current - total_hist) / total_hist) * 100, 4)
+
+    pf_changes = {pk: portfolio_pct(pk) for pk in PERIOD_KEYS}
+
+    # ── Portfolio Overview Card ──────────────────────────────
+    pf_changes_html = ""
+    for pk, pl in zip(PERIOD_KEYS, PERIOD_LABELS):
+        v   = pf_changes[pk]
+        cls = color_pct(v)
+        pf_changes_html += (
+            f'<div style="text-align:center;padding:0.5rem 0.8rem;'
+            f'background:#0b0f19;border-radius:8px;min-width:90px">'
+            f'<div style="font-size:0.65rem;color:#64748b;text-transform:uppercase;'
+            f'letter-spacing:0.08em">{pl}</div>'
+            f'<div class="{cls}" style="font-size:0.95rem;font-weight:700;margin-top:0.2rem">{fmt_pct(v)}</div>'
+            f'</div>'
+        )
+
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,#0d1f3c,#111827);border:1px solid #3b82f6;
+         border-radius:16px;padding:1.4rem 1.6rem;margin-bottom:1.2rem">
+      <div style="font-size:0.75rem;color:#3b82f6;text-transform:uppercase;
+           letter-spacing:0.1em;font-weight:600;margin-bottom:0.6rem">🗂 Overall Portfolio (1 unit each)</div>
+      <div style="display:flex;align-items:baseline;gap:0.8rem;margin-bottom:0.9rem">
+        <span style="font-size:1.5rem;font-weight:700;color:#00d4aa">₹{total_nav_current:,.4f}</span>
+        <span style="font-size:0.75rem;color:#64748b">combined NAV (1 unit per fund)</span>
+      </div>
+      <div style="display:flex;gap:0.6rem;flex-wrap:wrap">{pf_changes_html}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
     # ── 2a: Summary KPI row ──────────────────────────────────
     total_inv = sum(f["invested"] for f in st.session_state.portfolio)
     pct_1m_vals = [(f["scheme_name"], get_pct(f, "1m")) for f in perf_data if get_pct(f, "1m") is not None]
     best_fund = max(pct_1m_vals, key=lambda x: x[1], default=("—", None))
     worst_fund = min(pct_1m_vals, key=lambda x: x[1], default=("—", None))
 
-    k1, k2, k3, k4 = st.columns(4)
+    # Portfolio 1M vs Nifty 50 1M delta
+    pf_1m = pf_changes.get("1m")
+    nifty_1m = next((b.get("change_1m") for b in bm_data if b.get("symbol") == "^NSEI"), None)
+    vs_nifty_str = "N/A"
+    if pf_1m is not None and nifty_1m is not None:
+        delta = round(pf_1m - nifty_1m, 2)
+        sign = "+" if delta >= 0 else ""
+        vs_nifty_str = f"{sign}{delta:.2f}%"
+
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
     kpis = [
-        ("Total Invested", f"₹{total_inv:,.0f}", "across all funds"),
-        ("Funds Tracked", str(len(perf_data)), "in portfolio"),
-        ("Best 1M Return", fmt_pct(best_fund[1]), best_fund[0][:30] if best_fund[0] != "—" else "—"),
-        ("Worst 1M Return", fmt_pct(worst_fund[1]), worst_fund[0][:30] if worst_fund[0] != "—" else "—"),
+        ("Total Invested",      f"₹{total_inv:,.0f}",            "across all funds"),
+        ("Funds Tracked",       str(len(perf_data)),              "in portfolio"),
+        ("Portfolio 1M Return", fmt_pct(pf_1m),                  "combined NAV basis"),
+        ("vs Nifty 50 (1M)",   vs_nifty_str,                    "portfolio alpha"),
+        ("Best 1M (Fund)",      fmt_pct(best_fund[1]),           best_fund[0][:25] if best_fund[0] != "—" else "—"),
+        ("Worst 1M (Fund)",     fmt_pct(worst_fund[1]),          worst_fund[0][:25] if worst_fund[0] != "—" else "—"),
     ]
-    for col, (label, value, sub) in zip([k1, k2, k3, k4], kpis):
+    for col, (label, value, sub) in zip([k1, k2, k3, k4, k5, k6], kpis):
         with col:
             st.markdown(f"""
             <div class="metric-card">
               <div class="metric-label">{label}</div>
-              <div class="metric-value">{value}</div>
+              <div class="metric-value" style="font-size:1.4rem">{value}</div>
               <div class="metric-sub">{sub}</div>
             </div>
             """, unsafe_allow_html=True)
@@ -458,12 +534,64 @@ if st.session_state.show_dashboard and st.session_state.perf_data:
         </div>
         """, unsafe_allow_html=True)
 
-    # ── 2c: Comparative Bar Chart ─────────────────────────────
+    # ── 2b-bm: Benchmark Performance Cards ───────────────────
+    if bm_data:
+        st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
+        st.markdown('<div class="section-label">🌐 Benchmark Performance</div>', unsafe_allow_html=True)
+        bm_cols = st.columns(len(bm_data))
+        BM_PERIOD_MAP = {
+            "1d": ("1 Day",    "change_1d"),
+            "1w": ("1 Week",   "change_1w"),
+            "1m": ("1 Month",  "change_1m"),
+            "3m": ("3 Months", "change_3m"),
+            "6m": ("6 Months", "change_6m"),
+        }
+        BM_ICONS = {"^NSEI": "🇮🇳", "^GSPC": "🇺🇸", "XAUUSD=X": "🥇", "XAGUSD=X": "🥈"}
+        for col, bm in zip(bm_cols, bm_data):
+            with col:
+                icon = BM_ICONS.get(bm["symbol"], "📊")
+                price = bm.get("current_price")
+                currency = bm.get("currency") or ""
+                price_str = f"{price:,.4f} {currency}".strip() if price else "N/A"
+                rows_html = ""
+                for pk, (pl, bk) in BM_PERIOD_MAP.items():
+                    v = bm.get(bk)
+                    cls = color_pct(v)
+                    rows_html += (
+                        f'<div style="display:flex;justify-content:space-between;'
+                        f'padding:0.25rem 0;border-bottom:1px solid #1e293b">'
+                        f'<span style="font-size:0.72rem;color:#64748b">{pl}</span>'
+                        f'<span class="{cls}" style="font-size:0.78rem">{fmt_pct(v)}</span></div>'
+                    )
+                st.markdown(f"""
+                <div style="background:#111827;border:1px solid #1e293b;border-radius:14px;
+                     padding:1rem 1.1rem;margin-bottom:0.5rem">
+                  <div style="font-size:1.1rem;margin-bottom:0.2rem">{icon} <span style="font-weight:700;
+                       color:#e2e8f0;font-size:0.95rem">{bm['name']}</span></div>
+                  <div style="font-size:0.72rem;color:#64748b;margin-bottom:0.6rem">{bm['symbol']}</div>
+                  <div style="font-size:1.2rem;font-weight:700;color:#00d4aa;margin-bottom:0.7rem">{price_str}</div>
+                  {rows_html}
+                </div>
+                """, unsafe_allow_html=True)
+
+    # ── 2c: Comparative Bar Chart (funds) ─────────────────────
     st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">Comparative % Change by Period</div>', unsafe_allow_html=True)
 
     bar_fig = go.Figure()
     colors = px.colors.qualitative.Set2
+
+    # Portfolio aggregate trace
+    pf_y = [pf_changes.get(pk) for pk in PERIOD_KEYS]
+    bar_fig.add_trace(go.Bar(
+        name="📁 Portfolio (total NAV)",
+        x=PERIOD_LABELS,
+        y=pf_y,
+        marker_color="#00d4aa",
+        text=[fmt_pct(v) for v in pf_y],
+        textposition="outside",
+        textfont=dict(size=10),
+    ))
 
     for i, fd in enumerate(perf_data):
         name_short = fd["scheme_name"].split("(")[0].strip()[:40]
@@ -491,6 +619,46 @@ if st.session_state.show_dashboard and st.session_state.perf_data:
         height=420,
     )
     st.plotly_chart(bar_fig, use_container_width=True)
+
+    # ── 2c-bm: Benchmark vs Portfolio Bar Chart ────────────────
+    if bm_data:
+        st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
+        st.markdown('<div class="section-label">📊 Portfolio vs Benchmarks</div>', unsafe_allow_html=True)
+        bm_bar = go.Figure()
+        BM_COLORS = {"^NSEI": "#f59e0b", "^GSPC": "#3b82f6", "XAUUSD=X": "#fbbf24", "XAGUSD=X": "#94a3b8"}
+        BM_KEY_MAP = {"1d": "change_1d", "1w": "change_1w", "1m": "change_1m", "3m": "change_3m", "6m": "change_6m"}
+
+        # Portfolio aggregate
+        bm_bar.add_trace(go.Bar(
+            name="📁 Portfolio",
+            x=PERIOD_LABELS,
+            y=[pf_changes.get(pk) for pk in PERIOD_KEYS],
+            marker_color="#00d4aa",
+            text=[fmt_pct(pf_changes.get(pk)) for pk in PERIOD_KEYS],
+            textposition="outside", textfont=dict(size=10),
+        ))
+        for bm in bm_data:
+            y_bm = [bm.get(BM_KEY_MAP[pk]) for pk in PERIOD_KEYS]
+            bm_bar.add_trace(go.Bar(
+                name=bm["name"],
+                x=PERIOD_LABELS,
+                y=y_bm,
+                marker_color=BM_COLORS.get(bm["symbol"], "#64748b"),
+                text=[fmt_pct(v) for v in y_bm],
+                textposition="outside", textfont=dict(size=10),
+            ))
+        bm_bar.update_layout(
+            barmode="group",
+            plot_bgcolor="#111827", paper_bgcolor="#111827",
+            font=dict(color="#94a3b8", family="Inter"),
+            legend=dict(bgcolor="#0b0f19", bordercolor="#1e293b", borderwidth=1),
+            xaxis=dict(gridcolor="#1e293b"),
+            yaxis=dict(gridcolor="#1e293b", title="% Change", zeroline=True,
+                       zerolinecolor="#334155", zerolinewidth=1),
+            margin=dict(t=30, b=20),
+            height=400,
+        )
+        st.plotly_chart(bm_bar, use_container_width=True)
 
     # ── 2d: Radar Chart ───────────────────────────────────────
     st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
@@ -563,6 +731,17 @@ if st.session_state.show_dashboard and st.session_state.perf_data:
         import pandas as pd
 
         rows = []
+        # Portfolio aggregate row
+        pf_row = {
+            "Fund": "📁 Portfolio (total NAV)",
+            "Code": "—",
+            "NAV (₹)": round(total_nav_current, 4),
+            "Invested (₹)": f"₹{total_inv:,.0f}",
+        }
+        for pk, pl in zip(PERIOD_KEYS, PERIOD_LABELS):
+            pf_row[pl] = fmt_pct(pf_changes.get(pk))
+        rows.append(pf_row)
+
         for fd in perf_data:
             row = {
                 "Fund": fd["scheme_name"].split("(")[0].strip()[:40],
@@ -574,8 +753,21 @@ if st.session_state.show_dashboard and st.session_state.perf_data:
                 row[pl] = fmt_pct(get_pct(fd, pk))
             rows.append(row)
 
+        # Benchmark rows
+        BM_KEY_MAP2 = {"1d": "change_1d", "1w": "change_1w", "1m": "change_1m", "3m": "change_3m", "6m": "change_6m"}
+        for bm in bm_data:
+            bm_row = {
+                "Fund": f"[BM] {bm['name']}",
+                "Code": bm["symbol"],
+                "NAV (₹)": bm.get("current_price") or "N/A",
+                "Invested (₹)": "—",
+            }
+            for pk, pl in zip(PERIOD_KEYS, PERIOD_LABELS):
+                bm_row[pl] = fmt_pct(bm.get(BM_KEY_MAP2[pk]))
+            rows.append(bm_row)
+
         df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True, hide_index=True, height=340)
+        st.dataframe(df, use_container_width=True, hide_index=True, height=400)
 
     # ── Footnote ──────────────────────────────────────────────
     st.markdown(

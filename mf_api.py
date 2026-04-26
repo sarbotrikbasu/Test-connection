@@ -5,6 +5,7 @@ from typing import Optional
 import httpx
 from datetime import datetime, timedelta
 import math
+import yfinance as yf
 
 app = FastAPI(
     title="Indian Mutual Fund Price API",
@@ -59,6 +60,23 @@ class SearchResult(BaseModel):
     fund_house: str
     scheme_type: str
     scheme_category: str
+
+
+class BenchmarkPeriod(BaseModel):
+    symbol: str
+    name: str
+    current_price: Optional[float]
+    currency: Optional[str]
+    change_1d: Optional[float]   # % change
+    change_1w: Optional[float]
+    change_1m: Optional[float]
+    change_3m: Optional[float]
+    change_6m: Optional[float]
+
+
+class BenchmarksResponse(BaseModel):
+    benchmarks: list[BenchmarkPeriod]
+    fetched_at: str
 
 
 # ──────────────────────────────────────────────
@@ -228,3 +246,108 @@ async def search_funds(
         raise HTTPException(status_code=404, detail=f"No funds found matching '{q}'")
 
     return matches[:50]  # cap at 50 results
+
+
+# ──────────────────────────────────────────────
+# Benchmark Symbols
+# ──────────────────────────────────────────────
+
+BENCHMARK_SYMBOLS = [
+    {"symbol": "^NSEI",    "name": "Nifty 50"},
+    {"symbol": "^GSPC",    "name": "S&P 500"},
+    {"symbol": "XAUUSD=X", "name": "Gold Spot"},
+    {"symbol": "XAGUSD=X", "name": "Silver Spot"},
+]
+
+# Maps period key → (yfinance period arg, yfinance interval arg)
+# We fetch enough history so we can compute open-vs-close % change.
+PERIOD_YF_ARGS = {
+    "1d":  ("5d",  "1d"),
+    "1w":  ("1mo", "1d"),
+    "1m":  ("3mo", "1d"),
+    "3m":  ("6mo", "1d"),
+    "6m":  ("1y",  "1d"),
+}
+
+# Number of trading sessions to look back for each period
+PERIOD_SESSIONS = {"1d": 1, "1w": 5, "1m": 21, "3m": 63, "6m": 126}
+
+
+def _pct_change_yf(symbol: str, period_key: str) -> Optional[float]:
+    """Return % change for a yfinance symbol over the given period key."""
+    yf_period, yf_interval = PERIOD_YF_ARGS[period_key]
+    sessions = PERIOD_SESSIONS[period_key]
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period=yf_period, interval=yf_interval, auto_adjust=True)
+        if hist.empty or "Close" not in hist:
+            return None
+        closes = hist["Close"].dropna()
+        if len(closes) < 2:
+            return None
+        # Use the close `sessions` bars ago as the reference (or the oldest available)
+        ref_idx = max(0, len(closes) - 1 - sessions)
+        ref_price = float(closes.iloc[ref_idx])
+        cur_price = float(closes.iloc[-1])
+        if ref_price == 0:
+            return None
+        return round(((cur_price - ref_price) / ref_price) * 100, 4)
+    except Exception:
+        return None
+
+
+def _current_price_yf(symbol: str) -> tuple[Optional[float], Optional[str]]:
+    """Return (current_price, currency) for a yfinance symbol."""
+    try:
+        ticker = yf.Ticker(symbol)
+        info = ticker.get_info()
+        price = None
+        for key in ("regularMarketPrice", "currentPrice", "previousClose", "ask", "bid"):
+            v = info.get(key)
+            if isinstance(v, (int, float)) and v > 0:
+                price = round(float(v), 6)
+                break
+        if price is None:
+            hist = ticker.history(period="5d", interval="1d", auto_adjust=True)
+            if not hist.empty and "Close" in hist:
+                closes = hist["Close"].dropna()
+                if len(closes) > 0:
+                    price = round(float(closes.iloc[-1]), 6)
+        currency = info.get("currency")
+        return price, currency
+    except Exception:
+        return None, None
+
+
+@app.get(
+    "/benchmarks",
+    response_model=BenchmarksResponse,
+    tags=["Benchmarks"],
+    summary="Get Benchmark Performance",
+    description=(
+        "Returns price % changes over 1 day, 1 week, 1 month, 3 months, and 6 months "
+        "for Nifty 50 (^NSEI), S&P 500 (^GSPC), Gold Spot (XAUUSD=X), and Silver Spot (XAGUSD=X)."
+    ),
+)
+def get_benchmarks():
+    results: list[BenchmarkPeriod] = []
+    for bm in BENCHMARK_SYMBOLS:
+        sym = bm["symbol"]
+        price, currency = _current_price_yf(sym)
+        results.append(
+            BenchmarkPeriod(
+                symbol=sym,
+                name=bm["name"],
+                current_price=price,
+                currency=currency,
+                change_1d=_pct_change_yf(sym, "1d"),
+                change_1w=_pct_change_yf(sym, "1w"),
+                change_1m=_pct_change_yf(sym, "1m"),
+                change_3m=_pct_change_yf(sym, "3m"),
+                change_6m=_pct_change_yf(sym, "6m"),
+            )
+        )
+    return BenchmarksResponse(
+        benchmarks=results,
+        fetched_at=datetime.utcnow().isoformat() + "Z",
+    )
