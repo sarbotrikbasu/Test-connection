@@ -6,6 +6,7 @@ import httpx
 from datetime import datetime, timedelta
 import math
 import yfinance as yf
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = FastAPI(
     title="Indian Mutual Fund Price API",
@@ -259,64 +260,71 @@ BENCHMARK_SYMBOLS = [
     {"symbol": "XAGUSD=X", "name": "Silver Spot"},
 ]
 
-# Maps period key → (yfinance period arg, yfinance interval arg)
-# We fetch enough history so we can compute open-vs-close % change.
-PERIOD_YF_ARGS = {
-    "1d":  ("5d",  "1d"),
-    "1w":  ("1mo", "1d"),
-    "1m":  ("3mo", "1d"),
-    "3m":  ("6mo", "1d"),
-    "6m":  ("1y",  "1d"),
-}
-
-# Number of trading sessions to look back for each period
+# Trading sessions to look back per period
 PERIOD_SESSIONS = {"1d": 1, "1w": 5, "1m": 21, "3m": 63, "6m": 126}
 
 
-def _pct_change_yf(symbol: str, period_key: str) -> Optional[float]:
-    """Return % change for a yfinance symbol over the given period key."""
-    yf_period, yf_interval = PERIOD_YF_ARGS[period_key]
-    sessions = PERIOD_SESSIONS[period_key]
+def _fetch_one_benchmark(bm: dict) -> BenchmarkPeriod:
+    """
+    Fetch 1 year of daily history for a symbol in a single yf.download() call,
+    then derive all period % changes from that one dataset.
+    """
+    sym = bm["symbol"]
     try:
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(period=yf_period, interval=yf_interval, auto_adjust=True)
-        if hist.empty or "Close" not in hist:
-            return None
-        closes = hist["Close"].dropna()
-        if len(closes) < 2:
-            return None
-        # Use the close `sessions` bars ago as the reference (or the oldest available)
-        ref_idx = max(0, len(closes) - 1 - sessions)
-        ref_price = float(closes.iloc[ref_idx])
+        df = yf.download(
+            sym,
+            period="1y",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+        )
+        if df.empty or "Close" not in df.columns:
+            raise ValueError("No data")
+
+        # Flatten MultiIndex columns — yf.download() always returns MultiIndex
+        # in newer versions even for a single ticker
+        if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
+            df.columns = df.columns.get_level_values(0)
+
+        closes = df["Close"].dropna()
         cur_price = float(closes.iloc[-1])
-        if ref_price == 0:
-            return None
-        return round(((cur_price - ref_price) / ref_price) * 100, 4)
-    except Exception:
-        return None
+        n = len(closes)
 
+        def pct(sessions: int) -> Optional[float]:
+            ref_idx = max(0, n - 1 - sessions)
+            ref = float(closes.iloc[ref_idx])
+            if ref == 0:
+                return None
+            return round(((cur_price - ref) / ref) * 100, 4)
 
-def _current_price_yf(symbol: str) -> tuple[Optional[float], Optional[str]]:
-    """Return (current_price, currency) for a yfinance symbol."""
-    try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.get_info()
-        price = None
-        for key in ("regularMarketPrice", "currentPrice", "previousClose", "ask", "bid"):
-            v = info.get(key)
-            if isinstance(v, (int, float)) and v > 0:
-                price = round(float(v), 6)
-                break
-        if price is None:
-            hist = ticker.history(period="5d", interval="1d", auto_adjust=True)
-            if not hist.empty and "Close" in hist:
-                closes = hist["Close"].dropna()
-                if len(closes) > 0:
-                    price = round(float(closes.iloc[-1]), 6)
-        currency = info.get("currency")
-        return price, currency
-    except Exception:
-        return None, None
+        # Currency: derive from ticker info (fast call, cached by yf)
+        try:
+            info = yf.Ticker(sym).fast_info
+            currency = getattr(info, "currency", None)
+        except Exception:
+            currency = None
+
+        return BenchmarkPeriod(
+            symbol=sym,
+            name=bm["name"],
+            current_price=round(cur_price, 6),
+            currency=currency,
+            change_1d=pct(PERIOD_SESSIONS["1d"]),
+            change_1w=pct(PERIOD_SESSIONS["1w"]),
+            change_1m=pct(PERIOD_SESSIONS["1m"]),
+            change_3m=pct(PERIOD_SESSIONS["3m"]),
+            change_6m=pct(PERIOD_SESSIONS["6m"]),
+        )
+
+    except Exception as exc:
+        # Return a stub with nulls so the endpoint never crashes
+        return BenchmarkPeriod(
+            symbol=sym, name=bm["name"],
+            current_price=None, currency=None,
+            change_1d=None, change_1w=None,
+            change_1m=None, change_3m=None, change_6m=None,
+        )
 
 
 @app.get(
@@ -330,24 +338,17 @@ def _current_price_yf(symbol: str) -> tuple[Optional[float], Optional[str]]:
     ),
 )
 def get_benchmarks():
-    results: list[BenchmarkPeriod] = []
-    for bm in BENCHMARK_SYMBOLS:
-        sym = bm["symbol"]
-        price, currency = _current_price_yf(sym)
-        results.append(
-            BenchmarkPeriod(
-                symbol=sym,
-                name=bm["name"],
-                current_price=price,
-                currency=currency,
-                change_1d=_pct_change_yf(sym, "1d"),
-                change_1w=_pct_change_yf(sym, "1w"),
-                change_1m=_pct_change_yf(sym, "1m"),
-                change_3m=_pct_change_yf(sym, "3m"),
-                change_6m=_pct_change_yf(sym, "6m"),
-            )
-        )
+    """Fetch all 4 benchmarks in parallel — one yf.download() per symbol."""
+    results_map: dict[str, BenchmarkPeriod] = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(_fetch_one_benchmark, bm): bm["symbol"] for bm in BENCHMARK_SYMBOLS}
+        for future in as_completed(futures):
+            sym = futures[future]
+            results_map[sym] = future.result()
+
+    # Preserve the original order
+    ordered = [results_map[bm["symbol"]] for bm in BENCHMARK_SYMBOLS]
     return BenchmarksResponse(
-        benchmarks=results,
+        benchmarks=ordered,
         fetched_at=datetime.utcnow().isoformat() + "Z",
     )

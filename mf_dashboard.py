@@ -192,11 +192,11 @@ def get_fund_performance(scheme_code: int) -> Optional[dict]:
 
 def get_benchmarks() -> List[dict]:
     try:
-        r = requests.get(f"{API_BASE}/benchmarks", timeout=30)
+        r = requests.get(f"{API_BASE}/benchmarks", timeout=60)
         r.raise_for_status()
         return r.json().get("benchmarks", [])
     except Exception as e:
-        st.warning(f"Could not fetch benchmark data: {e}")
+        st.warning(f"⚠️ Benchmark data unavailable: {e}")
         return []
 
 # ──────────────────────────────────────────────────────────────
@@ -586,6 +586,10 @@ if st.session_state.show_dashboard and st.session_state.perf_data:
                   {rows_html}
                 </div>
                 """, unsafe_allow_html=True)
+
+    else:
+        st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
+        st.info("🌐 Benchmark data could not be loaded. The backend may need a moment — try clicking Analyse Portfolio again.")
 
     # ── 2c: Comparative Bar Chart (funds) ─────────────────────
     st.markdown('<hr class="custom-divider">', unsafe_allow_html=True)
